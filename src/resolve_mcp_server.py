@@ -1223,6 +1223,51 @@ def clear_transcription(clip_name: str) -> str:
     except Exception as e:
         return f"Error clearing audio transcription: {str(e)}"
 
+# --------------------
+# Helper Functions
+# --------------------
+
+def _get_current_timeline():
+    """Get the current timeline with standard error checking.
+
+    Returns:
+        Tuple of (project, timeline, error_string). If timeline is None, error_string explains why.
+    """
+    if resolve is None:
+        return None, None, "Error: Not connected to DaVinci Resolve"
+    project_manager = resolve.GetProjectManager()
+    if not project_manager:
+        return None, None, "Error: Failed to get Project Manager"
+    current_project = project_manager.GetCurrentProject()
+    if not current_project:
+        return None, None, "Error: No project currently open"
+    current_timeline = current_project.GetCurrentTimeline()
+    if not current_timeline:
+        return current_project, None, "Error: No timeline currently active"
+    return current_project, current_timeline, None
+
+
+def _find_timeline_item(timeline, timeline_item_id: str):
+    """Find a timeline item by unique ID across all tracks.
+
+    Args:
+        timeline: The current timeline object
+        timeline_item_id: The unique ID string of the item
+
+    Returns:
+        Tuple of (timeline_item, track_type, track_index) or (None, None, None)
+    """
+    for track_type in ["video", "audio", "subtitle"]:
+        track_count = timeline.GetTrackCount(track_type)
+        for track_index in range(1, track_count + 1):
+            items = timeline.GetItemListInTrack(track_type, track_index)
+            if items:
+                for item in items:
+                    if str(item.GetUniqueId()) == timeline_item_id:
+                        return item, track_type, track_index
+    return None, None, None
+
+
 # Utility function to get all clips from the media pool (recursively)
 def get_all_media_pool_clips(media_pool):
     """Get all clips from media pool recursively including subfolders."""
@@ -4624,6 +4669,1048 @@ def get_project_info_endpoint() -> Dict[str, Any]:
         return {"error": "No project currently open"}
     
     return get_project_info(current_project)
+
+# ============================================================
+# Editing Operations
+# ============================================================
+
+# --------------------
+# Visual Feedback
+# --------------------
+
+@mcp.tool()
+def export_current_frame_as_still(file_path: str) -> str:
+    """Export the current frame visible in the viewer as a still image file.
+
+    Args:
+        file_path: Absolute path to save the still image. Must end in a valid
+                   image extension (e.g., .png, .jpg, .tiff, .dpx, .exr).
+    """
+    project, timeline, err = _get_current_timeline()
+    if project is None:
+        return err
+
+    try:
+        result = project.ExportCurrentFrameAsStill(file_path)
+        if result:
+            return f"Successfully exported current frame to '{file_path}'"
+        else:
+            return f"Failed to export current frame. Ensure the file path is valid and ends with a supported extension (.png, .jpg, .tiff, .dpx, .exr)"
+    except Exception as e:
+        return f"Error exporting frame: {str(e)}"
+
+
+@mcp.tool()
+def get_current_clip_thumbnail() -> Dict[str, Any]:
+    """Get a thumbnail image of the clip currently under the playhead in the Color page.
+
+    Returns a dictionary with 'width', 'height', 'format', and 'data' (base64 encoded RGB).
+    Must be on the Color page for this to work.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return {"error": err}
+
+    try:
+        thumb = timeline.GetCurrentClipThumbnailImage()
+        if thumb:
+            return {"result": thumb}
+        else:
+            return {"error": "Failed to get thumbnail. Ensure you are on the Color page with a clip selected."}
+    except Exception as e:
+        return {"error": f"Error getting thumbnail: {str(e)}"}
+
+
+@mcp.tool()
+def grab_still() -> str:
+    """Grab a still from the current frame and save it to the gallery.
+
+    Must be on the Color page. The still is saved to the currently active gallery album.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        still = timeline.GrabStill()
+        if still:
+            return "Successfully grabbed still to gallery"
+        else:
+            return "Failed to grab still. Ensure you are on the Color page."
+    except Exception as e:
+        return f"Error grabbing still: {str(e)}"
+
+
+# --------------------
+# Playhead Control
+# --------------------
+
+@mcp.tool()
+def get_current_timecode() -> str:
+    """Get the current playhead timecode position in the active timeline.
+
+    Returns timecode string in HH:MM:SS:FF format. Works on Cut, Edit, Color,
+    Fairlight, and Deliver pages.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        tc = timeline.GetCurrentTimecode()
+        if tc:
+            return f"Current timecode: {tc}"
+        else:
+            return "Error: Could not get current timecode"
+    except Exception as e:
+        return f"Error getting timecode: {str(e)}"
+
+
+@mcp.tool()
+def set_current_timecode(timecode: str) -> str:
+    """Move the playhead to a specific timecode position.
+
+    Args:
+        timecode: Target timecode in HH:MM:SS:FF format (e.g., '01:00:05:12')
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.SetCurrentTimecode(timecode)
+        if result:
+            return f"Playhead moved to {timecode}"
+        else:
+            return f"Failed to set timecode to '{timecode}'. Ensure the format is HH:MM:SS:FF and within timeline range."
+    except Exception as e:
+        return f"Error setting timecode: {str(e)}"
+
+
+@mcp.tool()
+def get_current_video_item() -> str:
+    """Get information about the video clip currently under the playhead.
+
+    Returns clip details including ID, name, start/end frames, duration, and track info.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item = timeline.GetCurrentVideoItem()
+        if not item:
+            return "No video item at current playhead position"
+
+        track_info = item.GetTrackTypeAndIndex()
+        info = {
+            "id": str(item.GetUniqueId()),
+            "name": item.GetName(),
+            "start_frame": item.GetStart(),
+            "end_frame": item.GetEnd(),
+            "duration": item.GetDuration(),
+            "track_type": track_info[0] if track_info else "unknown",
+            "track_index": track_info[1] if track_info else 0,
+            "enabled": item.GetClipEnabled(),
+            "left_offset": item.GetLeftOffset(),
+            "right_offset": item.GetRightOffset(),
+        }
+        lines = [f"Clip under playhead:"]
+        for k, v in info.items():
+            lines.append(f"  {k}: {v}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting current video item: {str(e)}"
+
+
+# --------------------
+# Enhanced Timeline State
+# --------------------
+
+@mcp.tool()
+def get_timeline_items_detailed() -> str:
+    """Get a detailed list of all items in the current timeline.
+
+    Returns all clips organized by track with positions, durations, enabled state,
+    available handles (left/right offsets), and source frame info.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        lines = [f"Timeline: {timeline.GetName()}"]
+        lines.append(f"Timecode: {timeline.GetCurrentTimecode()}")
+        lines.append(f"Start: {timeline.GetStartFrame()} | End: {timeline.GetEndFrame()}")
+        lines.append("")
+
+        for track_type in ["video", "audio", "subtitle"]:
+            track_count = timeline.GetTrackCount(track_type)
+            if track_count == 0:
+                continue
+            for track_index in range(1, track_count + 1):
+                track_name = timeline.GetTrackName(track_type, track_index)
+                items = timeline.GetItemListInTrack(track_type, track_index)
+                item_count = len(items) if items else 0
+                lines.append(f"--- {track_type.upper()} Track {track_index}: {track_name} ({item_count} items) ---")
+
+                if items:
+                    for item in items:
+                        enabled_str = "ON" if item.GetClipEnabled() else "OFF"
+                        lines.append(
+                            f"  [{enabled_str}] {item.GetName()} | "
+                            f"ID: {item.GetUniqueId()} | "
+                            f"Frames: {item.GetStart()}-{item.GetEnd()} "
+                            f"(dur: {item.GetDuration()}) | "
+                            f"Handles L:{item.GetLeftOffset()} R:{item.GetRightOffset()}"
+                        )
+                lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting timeline items: {str(e)}"
+
+
+@mcp.tool()
+def get_timeline_bounds() -> str:
+    """Get the start frame, end frame, and current timecode of the active timeline."""
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        return (
+            f"Timeline: {timeline.GetName()}\n"
+            f"Start frame: {timeline.GetStartFrame()}\n"
+            f"End frame: {timeline.GetEndFrame()}\n"
+            f"Current timecode: {timeline.GetCurrentTimecode()}"
+        )
+    except Exception as e:
+        return f"Error getting timeline bounds: {str(e)}"
+
+
+# --------------------
+# Clip Manipulation
+# --------------------
+
+@mcp.tool()
+def delete_timeline_clips(timeline_item_ids: List[str], ripple: bool = False) -> str:
+    """Delete one or more clips from the timeline.
+
+    Args:
+        timeline_item_ids: List of timeline item unique IDs to delete
+        ripple: If True, close the gap left by deleted clips (ripple delete).
+                If False, leave the gap. Default is False.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        items_to_delete = []
+        not_found = []
+        for item_id in timeline_item_ids:
+            item, _, _ = _find_timeline_item(timeline, item_id)
+            if item:
+                items_to_delete.append(item)
+            else:
+                not_found.append(item_id)
+
+        if not items_to_delete:
+            return f"Error: No matching timeline items found. IDs not found: {not_found}"
+
+        result = timeline.DeleteClips(items_to_delete, ripple)
+        msg = f"Deleted {len(items_to_delete)} clip(s)" + (" with ripple" if ripple else "")
+        if not_found:
+            msg += f". IDs not found: {not_found}"
+        if result:
+            return msg
+        else:
+            return f"Failed to delete clips"
+    except Exception as e:
+        return f"Error deleting clips: {str(e)}"
+
+
+@mcp.tool()
+def set_clip_enabled(timeline_item_id: str, enabled: bool) -> str:
+    """Enable or disable a clip in the timeline (like muting/unmuting).
+
+    Args:
+        timeline_item_id: The unique ID of the timeline item
+        enabled: True to enable the clip, False to disable it
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item, _, _ = _find_timeline_item(timeline, timeline_item_id)
+        if not item:
+            return f"Error: Timeline item with ID '{timeline_item_id}' not found"
+
+        result = item.SetClipEnabled(enabled)
+        state = "enabled" if enabled else "disabled"
+        if result:
+            return f"Successfully {state} clip '{item.GetName()}'"
+        else:
+            return f"Failed to {state} clip '{item.GetName()}'"
+    except Exception as e:
+        return f"Error setting clip enabled state: {str(e)}"
+
+
+@mcp.tool()
+def get_clip_enabled(timeline_item_id: str) -> str:
+    """Check if a timeline clip is enabled or disabled.
+
+    Args:
+        timeline_item_id: The unique ID of the timeline item
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item, _, _ = _find_timeline_item(timeline, timeline_item_id)
+        if not item:
+            return f"Error: Timeline item with ID '{timeline_item_id}' not found"
+
+        enabled = item.GetClipEnabled()
+        state = "enabled" if enabled else "disabled"
+        return f"Clip '{item.GetName()}' is {state}"
+    except Exception as e:
+        return f"Error getting clip enabled state: {str(e)}"
+
+
+@mcp.tool()
+def set_clips_linked(timeline_item_ids: List[str], linked: bool) -> str:
+    """Link or unlink timeline items (e.g., link video and audio together).
+
+    Args:
+        timeline_item_ids: List of timeline item unique IDs to link/unlink
+        linked: True to link clips together, False to unlink them
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        items = []
+        not_found = []
+        for item_id in timeline_item_ids:
+            item, _, _ = _find_timeline_item(timeline, item_id)
+            if item:
+                items.append(item)
+            else:
+                not_found.append(item_id)
+
+        if not items:
+            return f"Error: No matching timeline items found. IDs not found: {not_found}"
+
+        result = timeline.SetClipsLinked(items, linked)
+        action = "linked" if linked else "unlinked"
+        if result:
+            return f"Successfully {action} {len(items)} clip(s)"
+        else:
+            return f"Failed to {action} clips"
+    except Exception as e:
+        return f"Error setting clip link state: {str(e)}"
+
+
+@mcp.tool()
+def get_linked_items(timeline_item_id: str) -> str:
+    """Get all items linked to a specific timeline item.
+
+    Args:
+        timeline_item_id: The unique ID of the timeline item
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item, _, _ = _find_timeline_item(timeline, timeline_item_id)
+        if not item:
+            return f"Error: Timeline item with ID '{timeline_item_id}' not found"
+
+        linked = item.GetLinkedItems()
+        if not linked:
+            return f"Clip '{item.GetName()}' has no linked items"
+
+        lines = [f"Items linked to '{item.GetName()}':"]
+        for linked_item in linked:
+            track_info = linked_item.GetTrackTypeAndIndex()
+            lines.append(
+                f"  {linked_item.GetName()} | ID: {linked_item.GetUniqueId()} | "
+                f"Track: {track_info[0]} {track_info[1]}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting linked items: {str(e)}"
+
+
+# --------------------
+# Insert at Position
+# --------------------
+
+@mcp.tool()
+def append_to_timeline_with_options(
+    clip_name: str,
+    start_frame: int = None,
+    end_frame: int = None,
+    track_index: int = None,
+    record_frame: int = None,
+    media_type: int = None
+) -> str:
+    """Add a media pool clip to the timeline with precise placement options.
+
+    Args:
+        clip_name: Name of the clip in the media pool
+        start_frame: Source start frame (in point on the source clip). Optional.
+        end_frame: Source end frame (out point on the source clip). Optional.
+        track_index: Target video/audio track index (1-based). Optional.
+        record_frame: Timeline frame where the clip should be placed. Optional.
+        media_type: 1 for video only, 2 for audio only. Omit for both. Optional.
+    """
+    if resolve is None:
+        return "Error: Not connected to DaVinci Resolve"
+
+    project_manager = resolve.GetProjectManager()
+    if not project_manager:
+        return "Error: Failed to get Project Manager"
+
+    current_project = project_manager.GetCurrentProject()
+    if not current_project:
+        return "Error: No project currently open"
+
+    media_pool = current_project.GetMediaPool()
+    if not media_pool:
+        return "Error: Failed to get Media Pool"
+
+    # Find the clip by name
+    clips = get_all_media_pool_clips(media_pool)
+    target_clip = None
+    for clip in clips:
+        if clip.GetName() == clip_name:
+            target_clip = clip
+            break
+
+    if not target_clip:
+        return f"Error: Clip '{clip_name}' not found in Media Pool"
+
+    try:
+        clip_info = {"mediaPoolItem": target_clip}
+        if start_frame is not None:
+            clip_info["startFrame"] = start_frame
+        if end_frame is not None:
+            clip_info["endFrame"] = end_frame
+        if track_index is not None:
+            clip_info["trackIndex"] = track_index
+        if record_frame is not None:
+            clip_info["recordFrame"] = record_frame
+        if media_type is not None:
+            clip_info["mediaType"] = media_type
+
+        result = media_pool.AppendToTimeline([clip_info])
+        if result:
+            return f"Successfully added '{clip_name}' to timeline" + (
+                f" at frame {record_frame}" if record_frame is not None else ""
+            ) + (
+                f" on track {track_index}" if track_index is not None else ""
+            )
+        else:
+            return f"Failed to add '{clip_name}' to timeline"
+    except Exception as e:
+        return f"Error adding clip to timeline: {str(e)}"
+
+
+# --------------------
+# Titles & Generators
+# --------------------
+
+@mcp.tool()
+def insert_title(title_name: str) -> str:
+    """Insert a title template into the timeline at the current playhead position.
+
+    Args:
+        title_name: Name of the title template (e.g., 'Text+', 'Lower Third', 'Scroll')
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item = timeline.InsertTitleIntoTimeline(title_name)
+        if item:
+            return f"Inserted title '{title_name}' | ID: {item.GetUniqueId()}"
+        else:
+            return f"Failed to insert title '{title_name}'. Check the title name is correct."
+    except Exception as e:
+        return f"Error inserting title: {str(e)}"
+
+
+@mcp.tool()
+def insert_fusion_title(title_name: str) -> str:
+    """Insert a Fusion title into the timeline at the current playhead position.
+
+    Args:
+        title_name: Name of the Fusion title template
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item = timeline.InsertFusionTitleIntoTimeline(title_name)
+        if item:
+            return f"Inserted Fusion title '{title_name}' | ID: {item.GetUniqueId()}"
+        else:
+            return f"Failed to insert Fusion title '{title_name}'. Check the title name is correct."
+    except Exception as e:
+        return f"Error inserting Fusion title: {str(e)}"
+
+
+@mcp.tool()
+def insert_generator(generator_name: str) -> str:
+    """Insert a generator (solid color, gradient, etc.) into the timeline.
+
+    Args:
+        generator_name: Name of the generator (e.g., 'Solid Color', '10 Step', 'Gray Scale')
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item = timeline.InsertGeneratorIntoTimeline(generator_name)
+        if item:
+            return f"Inserted generator '{generator_name}' | ID: {item.GetUniqueId()}"
+        else:
+            return f"Failed to insert generator '{generator_name}'. Check the generator name is correct."
+    except Exception as e:
+        return f"Error inserting generator: {str(e)}"
+
+
+@mcp.tool()
+def insert_fusion_generator(generator_name: str) -> str:
+    """Insert a Fusion generator into the timeline.
+
+    Args:
+        generator_name: Name of the Fusion generator
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item = timeline.InsertFusionGeneratorIntoTimeline(generator_name)
+        if item:
+            return f"Inserted Fusion generator '{generator_name}' | ID: {item.GetUniqueId()}"
+        else:
+            return f"Failed to insert Fusion generator '{generator_name}'. Check the generator name is correct."
+    except Exception as e:
+        return f"Error inserting Fusion generator: {str(e)}"
+
+
+# --------------------
+# Timeline Export
+# --------------------
+
+@mcp.tool()
+def export_timeline(file_path: str, export_type: str, export_subtype: str = None) -> str:
+    """Export the current timeline to a file.
+
+    Args:
+        file_path: Absolute path for the exported file
+        export_type: Export format. Options: 'AAF', 'DRT', 'EDL', 'FCP_7_XML',
+                     'FCPXML_1_8', 'FCPXML_1_9', 'FCPXML_1_10', 'HDL', 'OTIO',
+                     'TEXT_CSV', 'TEXT_TAB', 'MIDI_FILE'
+        export_subtype: Optional subtype for certain formats (e.g., for EDL: 'CMX_3600', 'CMX_3600_2398')
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    # Map string export types to resolve constants
+    type_map = {
+        "AAF": "EXPORT_AAF",
+        "DRT": "EXPORT_DRT",
+        "EDL": "EXPORT_EDL",
+        "FCP_7_XML": "EXPORT_FCP_7_XML",
+        "FCPXML_1_8": "EXPORT_FCPXML_1_8",
+        "FCPXML_1_9": "EXPORT_FCPXML_1_9",
+        "FCPXML_1_10": "EXPORT_FCPXML_1_10",
+        "HDL": "EXPORT_HDL",
+        "OTIO": "EXPORT_OTIO",
+        "TEXT_CSV": "EXPORT_TEXT_CSV",
+        "TEXT_TAB": "EXPORT_TEXT_TAB",
+        "MIDI_FILE": "EXPORT_MIDI_FILE",
+    }
+
+    subtype_map = {
+        "CMX_3600": "EXPORT_CDL",
+        "CMX_3600_2398": "EXPORT_SDL",
+        "NONE": "EXPORT_NONE",
+    }
+
+    if export_type not in type_map:
+        return f"Error: Invalid export_type '{export_type}'. Options: {', '.join(type_map.keys())}"
+
+    try:
+        export_type_const = getattr(resolve, type_map[export_type], None)
+        if export_type_const is None:
+            return f"Error: Export constant '{type_map[export_type]}' not found in this version of DaVinci Resolve"
+
+        export_subtype_const = None
+        if export_subtype:
+            if export_subtype in subtype_map:
+                export_subtype_const = getattr(resolve, subtype_map[export_subtype], None)
+            else:
+                export_subtype_const = getattr(resolve, f"EXPORT_{export_subtype}", None)
+
+        if export_subtype_const is not None:
+            result = timeline.Export(file_path, export_type_const, export_subtype_const)
+        else:
+            result = timeline.Export(file_path, export_type_const)
+
+        if result:
+            return f"Successfully exported timeline to '{file_path}' as {export_type}"
+        else:
+            return f"Failed to export timeline as {export_type}"
+    except Exception as e:
+        return f"Error exporting timeline: {str(e)}"
+
+
+@mcp.tool()
+def duplicate_timeline(new_name: str = None) -> str:
+    """Duplicate the current timeline.
+
+    Args:
+        new_name: Name for the duplicated timeline. Defaults to original name with suffix.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        if new_name:
+            new_timeline = timeline.DuplicateTimeline(new_name)
+        else:
+            new_timeline = timeline.DuplicateTimeline()
+
+        if new_timeline:
+            return f"Successfully duplicated timeline. New timeline: '{new_timeline.GetName()}'"
+        else:
+            return "Failed to duplicate timeline"
+    except Exception as e:
+        return f"Error duplicating timeline: {str(e)}"
+
+
+# --------------------
+# Track Management
+# --------------------
+
+@mcp.tool()
+def add_track(track_type: str, sub_track_type: str = None) -> str:
+    """Add a new track to the current timeline.
+
+    Args:
+        track_type: Type of track to add. Options: 'video', 'audio', 'subtitle'
+        sub_track_type: Audio track format. Options: 'mono', 'stereo', '5.1', '7.1'.
+                        Only used when track_type is 'audio'. Defaults to 'mono'.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    if track_type not in ("video", "audio", "subtitle"):
+        return f"Error: track_type must be 'video', 'audio', or 'subtitle'"
+
+    try:
+        if track_type == "audio" and sub_track_type:
+            result = timeline.AddTrack(track_type, sub_track_type)
+        else:
+            result = timeline.AddTrack(track_type)
+
+        if result:
+            new_count = timeline.GetTrackCount(track_type)
+            return f"Added {track_type} track. Total {track_type} tracks: {new_count}"
+        else:
+            return f"Failed to add {track_type} track"
+    except Exception as e:
+        return f"Error adding track: {str(e)}"
+
+
+@mcp.tool()
+def delete_track(track_type: str, track_index: int) -> str:
+    """Delete a track from the current timeline.
+
+    Args:
+        track_type: Type of track. Options: 'video', 'audio', 'subtitle'
+        track_index: 1-based index of the track to delete
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    if track_type not in ("video", "audio", "subtitle"):
+        return f"Error: track_type must be 'video', 'audio', or 'subtitle'"
+
+    try:
+        track_count = timeline.GetTrackCount(track_type)
+        if track_index < 1 or track_index > track_count:
+            return f"Error: track_index {track_index} out of range (1-{track_count})"
+
+        result = timeline.DeleteTrack(track_type, track_index)
+        if result:
+            return f"Deleted {track_type} track {track_index}"
+        else:
+            return f"Failed to delete {track_type} track {track_index}"
+    except Exception as e:
+        return f"Error deleting track: {str(e)}"
+
+
+@mcp.tool()
+def set_track_enabled(track_type: str, track_index: int, enabled: bool) -> str:
+    """Enable or disable a track.
+
+    Args:
+        track_type: Type of track. Options: 'video', 'audio', 'subtitle'
+        track_index: 1-based index of the track
+        enabled: True to enable, False to disable
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.SetTrackEnable(track_type, track_index, enabled)
+        state = "enabled" if enabled else "disabled"
+        if result:
+            return f"Successfully {state} {track_type} track {track_index}"
+        else:
+            return f"Failed to {state} {track_type} track {track_index}"
+    except Exception as e:
+        return f"Error setting track enabled state: {str(e)}"
+
+
+@mcp.tool()
+def set_track_lock(track_type: str, track_index: int, locked: bool) -> str:
+    """Lock or unlock a track (prevents editing when locked).
+
+    Args:
+        track_type: Type of track. Options: 'video', 'audio', 'subtitle'
+        track_index: 1-based index of the track
+        locked: True to lock, False to unlock
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.SetTrackLock(track_type, track_index, locked)
+        state = "locked" if locked else "unlocked"
+        if result:
+            return f"Successfully {state} {track_type} track {track_index}"
+        else:
+            return f"Failed to {state} {track_type} track {track_index}"
+    except Exception as e:
+        return f"Error setting track lock state: {str(e)}"
+
+
+@mcp.tool()
+def set_track_name(track_type: str, track_index: int, name: str) -> str:
+    """Set the display name of a track.
+
+    Args:
+        track_type: Type of track. Options: 'video', 'audio', 'subtitle'
+        track_index: 1-based index of the track
+        name: New name for the track
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.SetTrackName(track_type, track_index, name)
+        if result:
+            return f"Set {track_type} track {track_index} name to '{name}'"
+        else:
+            return f"Failed to set track name"
+    except Exception as e:
+        return f"Error setting track name: {str(e)}"
+
+
+# --------------------
+# Mark In/Out
+# --------------------
+
+@mcp.tool()
+def set_timeline_mark_in_out(mark_in: int, mark_out: int) -> str:
+    """Set the in and out mark points on the timeline (for render ranges, selections).
+
+    Args:
+        mark_in: Frame number for the in point
+        mark_out: Frame number for the out point
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.SetMarkInOut(mark_in, mark_out)
+        if result:
+            return f"Set mark in: {mark_in}, mark out: {mark_out}"
+        else:
+            return "Failed to set mark in/out points"
+    except Exception as e:
+        return f"Error setting marks: {str(e)}"
+
+
+@mcp.tool()
+def get_timeline_mark_in_out() -> str:
+    """Get the current in and out mark points on the timeline."""
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        marks = timeline.GetMarkInOut()
+        if marks:
+            return f"Mark in/out: {marks}"
+        else:
+            return "No mark in/out points set"
+    except Exception as e:
+        return f"Error getting marks: {str(e)}"
+
+
+@mcp.tool()
+def clear_timeline_mark_in_out() -> str:
+    """Clear the in and out mark points on the timeline."""
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.ClearMarkInOut()
+        if result:
+            return "Cleared mark in/out points"
+        else:
+            return "Failed to clear mark in/out points (or none were set)"
+    except Exception as e:
+        return f"Error clearing marks: {str(e)}"
+
+
+# --------------------
+# Scene Detection & Subtitles
+# --------------------
+
+@mcp.tool()
+def detect_scene_cuts() -> str:
+    """Automatically detect scene cuts in the current timeline.
+
+    Analyzes the video content to find scene transitions and adds cut points.
+    This may take some time depending on timeline length.
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        result = timeline.DetectSceneCuts()
+        if result:
+            return "Scene cut detection completed successfully"
+        else:
+            return "Scene cut detection failed or no cuts found"
+    except Exception as e:
+        return f"Error detecting scene cuts: {str(e)}"
+
+
+@mcp.tool()
+def create_subtitles_from_audio(language: str = "en") -> str:
+    """Auto-generate subtitles from the audio in the current timeline using AI.
+
+    Args:
+        language: Language code for transcription (e.g., 'en', 'es', 'fr', 'de', 'ja')
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        settings = {"language": language}
+        result = timeline.CreateSubtitlesFromAudio(settings)
+        if result:
+            return f"Subtitle generation started (language: {language}). This may take some time."
+        else:
+            return "Failed to create subtitles from audio. Ensure the timeline has audio content."
+    except Exception as e:
+        return f"Error creating subtitles: {str(e)}"
+
+
+# --------------------
+# Smart Tools
+# --------------------
+
+@mcp.tool()
+def smart_reframe(timeline_item_id: str) -> str:
+    """Apply Smart Reframe to a timeline clip (auto-reframes for different aspect ratios).
+
+    This is an AI-powered operation that may take some time to process.
+
+    Args:
+        timeline_item_id: The unique ID of the timeline item to reframe
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item, _, _ = _find_timeline_item(timeline, timeline_item_id)
+        if not item:
+            return f"Error: Timeline item with ID '{timeline_item_id}' not found"
+
+        result = item.SmartReframe()
+        if result:
+            return f"Smart Reframe applied to '{item.GetName()}'"
+        else:
+            return f"Smart Reframe failed for '{item.GetName()}'"
+    except Exception as e:
+        return f"Error applying Smart Reframe: {str(e)}"
+
+
+@mcp.tool()
+def create_magic_mask(timeline_item_id: str, mode: str = "F") -> str:
+    """Create a Magic Mask on a timeline clip for automatic subject isolation.
+
+    This is an AI-powered operation that may take some time to process.
+
+    Args:
+        timeline_item_id: The unique ID of the timeline item
+        mode: Mask mode - 'F' for forward, 'B' for backward, 'BI' for bidirectional
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    if mode not in ("F", "B", "BI"):
+        return "Error: mode must be 'F' (forward), 'B' (backward), or 'BI' (bidirectional)"
+
+    try:
+        item, _, _ = _find_timeline_item(timeline, timeline_item_id)
+        if not item:
+            return f"Error: Timeline item with ID '{timeline_item_id}' not found"
+
+        result = item.CreateMagicMask(mode)
+        if result:
+            return f"Magic Mask created on '{item.GetName()}' (mode: {mode})"
+        else:
+            return f"Magic Mask creation failed for '{item.GetName()}'"
+    except Exception as e:
+        return f"Error creating Magic Mask: {str(e)}"
+
+
+@mcp.tool()
+def stabilize_clip(timeline_item_id: str) -> str:
+    """Run stabilization analysis on a timeline clip.
+
+    This triggers the actual stabilization analysis (different from setting stabilization
+    parameters). May take some time to process.
+
+    Args:
+        timeline_item_id: The unique ID of the timeline item to stabilize
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        item, _, _ = _find_timeline_item(timeline, timeline_item_id)
+        if not item:
+            return f"Error: Timeline item with ID '{timeline_item_id}' not found"
+
+        result = item.Stabilize()
+        if result:
+            return f"Stabilization analysis completed for '{item.GetName()}'"
+        else:
+            return f"Stabilization analysis failed for '{item.GetName()}'"
+    except Exception as e:
+        return f"Error stabilizing clip: {str(e)}"
+
+
+# --------------------
+# Compound / Fusion Clips
+# --------------------
+
+@mcp.tool()
+def create_compound_clip(timeline_item_ids: List[str], clip_name: str = None) -> str:
+    """Create a compound clip from multiple timeline items (nesting).
+
+    Args:
+        timeline_item_ids: List of timeline item unique IDs to combine
+        clip_name: Optional name for the compound clip
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        items = []
+        not_found = []
+        for item_id in timeline_item_ids:
+            item, _, _ = _find_timeline_item(timeline, item_id)
+            if item:
+                items.append(item)
+            else:
+                not_found.append(item_id)
+
+        if not items:
+            return f"Error: No matching timeline items found. IDs not found: {not_found}"
+
+        clip_info = {}
+        if clip_name:
+            clip_info["name"] = clip_name
+
+        result = timeline.CreateCompoundClip(items, clip_info) if clip_info else timeline.CreateCompoundClip(items)
+        if result:
+            return f"Created compound clip from {len(items)} items | ID: {result.GetUniqueId()}"
+        else:
+            return "Failed to create compound clip"
+    except Exception as e:
+        return f"Error creating compound clip: {str(e)}"
+
+
+@mcp.tool()
+def create_fusion_clip(timeline_item_ids: List[str]) -> str:
+    """Create a Fusion clip from one or more timeline items.
+
+    Args:
+        timeline_item_ids: List of timeline item unique IDs
+    """
+    project, timeline, err = _get_current_timeline()
+    if timeline is None:
+        return err
+
+    try:
+        items = []
+        not_found = []
+        for item_id in timeline_item_ids:
+            item, _, _ = _find_timeline_item(timeline, item_id)
+            if item:
+                items.append(item)
+            else:
+                not_found.append(item_id)
+
+        if not items:
+            return f"Error: No matching timeline items found. IDs not found: {not_found}"
+
+        result = timeline.CreateFusionClip(items)
+        if result:
+            return f"Created Fusion clip from {len(items)} items | ID: {result.GetUniqueId()}"
+        else:
+            return "Failed to create Fusion clip"
+    except Exception as e:
+        return f"Error creating Fusion clip: {str(e)}"
+
 
 # Start the server
 if __name__ == "__main__":
